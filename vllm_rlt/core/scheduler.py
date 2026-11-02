@@ -788,10 +788,17 @@ class Scheduler:
     def _take(self, phase: RequestPhase) -> SchedulerOutput | None:
         return self.take_phases((phase,))
 
+    def _execution_row_cost(self, scheduled_request, phase):
+        """Execution rows for this span; dense work uses every logical token."""
+        return scheduled_request.token_count
+
     def take_phases(self, phases, *, eligible=None):
         """Select compatible requests across queues under one budget/reservation set."""
         eligible = eligible if eligible is not None else self.execution_ready
-        token_budget = self.config.max_num_batched_tokens
+        # Sparse execution may use fewer rows, but native staging still needs
+        # space for the full logical span.
+        logical_remaining = self.config.max_num_batched_tokens
+        physical_remaining = self.config.max_num_batched_tokens
         scheduled_requests = []
         selected: set[str] = set()
         for phase in phases:
@@ -800,17 +807,24 @@ class Scheduler:
                 RequestPhase.PREFILLING_PRELUDE,
                 RequestPhase.PREFILLING_RECURRENT,
             ):
-                token_budget = self._take_wavefront_phase(
+                logical_remaining, physical_remaining = self._take_wavefront_phase(
                     phase,
                     queue,
-                    token_budget,
+                    logical_remaining,
+                    physical_remaining,
                     scheduled_requests,
                     selected,
                     eligible,
                 )
                 continue
             remaining = len(queue)
-            while queue and token_budget and len(selected) < self.config.max_num_seqs and remaining:
+            while (
+                queue
+                and logical_remaining
+                and physical_remaining
+                and len(selected) < self.config.max_num_seqs
+                and remaining
+            ):
                 remaining -= 1
                 request = self.requests[queue.popleft()]
                 if eligible is not None and not eligible(request):
@@ -827,11 +841,21 @@ class Scheduler:
                 ):
                     queue.append(request.request_id)
                     continue
-                scheduled_request = self._make_scheduled_request(request, phase, token_budget)
+                scheduled_request = self._make_scheduled_request(request, phase, logical_remaining)
+                execution_cost = self._execution_row_cost(scheduled_request, phase)
+                if execution_cost > physical_remaining:
+                    # Shrink once to the tighter budget, then recompute the cost.
+                    scheduled_request = self._make_scheduled_request(
+                        request, phase, min(logical_remaining, physical_remaining)
+                    )
+                    execution_cost = self._execution_row_cost(scheduled_request, phase)
                 if (
                     phase in (RequestPhase.PREFILLING_PRELUDE, RequestPhase.PREFILLING_RECURRENT)
                     and scheduled_request.token_count <= 0
                 ):
+                    queue.append(request.request_id)
+                    continue
+                if execution_cost > physical_remaining:
                     queue.append(request.request_id)
                     continue
                 if phase in _CAPACITY_PHASES:
@@ -848,7 +872,8 @@ class Scheduler:
                 # Selecting A must prevent B's later capacity check from evicting A.
                 selected.add(request.request_id)
                 scheduled_requests.append(replace(scheduled_request, phase=phase))
-                token_budget -= scheduled_request.token_count
+                logical_remaining -= scheduled_request.token_count
+                physical_remaining -= execution_cost
         if not scheduled_requests:
             return None
         # Fairness follows the requests actually selected, including a mixed attempt
@@ -944,13 +969,26 @@ class Scheduler:
         )
 
     def _take_wavefront_phase(
-        self, phase, queue, token_budget, scheduled_requests, selected, eligible
+        self,
+        phase,
+        queue,
+        logical_remaining,
+        physical_remaining,
+        scheduled_requests,
+        selected,
+        eligible,
     ):
         """Round-robin each request's chunks/depths into the shared token budget."""
         remaining = len(queue)
         candidates = []
         owner_limit = self.config.max_num_seqs - len(selected)
-        while queue and remaining and len(candidates) < owner_limit and token_budget:
+        while (
+            queue
+            and remaining
+            and len(candidates) < owner_limit
+            and logical_remaining
+            and physical_remaining
+        ):
             remaining -= 1
             request = self.requests[queue.popleft()]
             if eligible is not None and not eligible(request):
@@ -968,15 +1006,17 @@ class Scheduler:
             candidates.append(request)
 
         if not candidates:
-            return token_budget
+            return logical_remaining, physical_remaining
 
         added = set()
         blocked = set()
         total_depths = len(candidates[0].prefill_depth_ranges)
 
-        def accept_task(request: Request, scheduled_request: ScheduledRequest) -> bool:
+        def accept_task(
+            request: Request, scheduled_request: ScheduledRequest, execution_cost: int
+        ) -> bool:
             """Reserve capacity and commit one wavefront task to this batch."""
-            nonlocal token_budget
+            nonlocal logical_remaining, physical_remaining
             request_id = request.request_id
             frontier = scheduled_request.token_start + scheduled_request.token_count
             if not self._ensure_execution_capacity(request, frontier, selected=selected):
@@ -984,8 +1024,18 @@ class Scheduler:
                 return False
             selected.add(request_id)
             added.add(request_id)
-            token_budget -= scheduled_request.token_count
+            logical_remaining -= scheduled_request.token_count
+            physical_remaining -= execution_cost
             return True
+
+        def build_task(request: Request, budget: int, *, start: int, depth):
+            return self._make_wavefront_task(
+                request,
+                phase,
+                budget,
+                depth=depth,
+                start=start,
+            )
 
         tasks = []
         prelude_cursors = (
@@ -996,7 +1046,7 @@ class Scheduler:
         for depth in range(total_depths):
             for owner_index, request in enumerate(candidates):
                 request_id = request.request_id
-                if token_budget <= 0:
+                if logical_remaining <= 0 or physical_remaining <= 0:
                     break
                 if request_id in blocked or request.phase != phase:
                     continue
@@ -1008,14 +1058,28 @@ class Scheduler:
                     end = min(end, request.num_preluded_tokens)
                 if start >= end:
                     continue
-                scheduled_request = self._make_wavefront_task(
-                    request,
-                    phase,
-                    token_budget,
-                    depth=(None if phase == RequestPhase.PREFILLING_PRELUDE else depth),
-                    start=start,
+                task_depth = None if phase == RequestPhase.PREFILLING_PRELUDE else depth
+                scheduled_request = build_task(
+                    request, logical_remaining, start=start, depth=task_depth
                 )
-                if scheduled_request is None or not accept_task(request, scheduled_request):
+                if scheduled_request is None:
+                    continue
+                execution_cost = self._execution_row_cost(scheduled_request, phase)
+                if execution_cost > physical_remaining:
+                    # A whole window may cost more than the remaining physical
+                    # budget; rebuild a smaller conservative fragment once.
+                    scheduled_request = build_task(
+                        request,
+                        min(logical_remaining, physical_remaining),
+                        start=start,
+                        depth=task_depth,
+                    )
+                    if scheduled_request is None:
+                        continue
+                    execution_cost = self._execution_row_cost(scheduled_request, phase)
+                if execution_cost > physical_remaining:
+                    continue
+                if not accept_task(request, scheduled_request, execution_cost):
                     continue
                 if phase == RequestPhase.PREFILLING_PRELUDE:
                     assert prelude_cursors is not None
@@ -1031,7 +1095,7 @@ class Scheduler:
             # it in WAITING. It must not also return to its old prompt queue.
             if request.request_id not in added and request.phase == phase:
                 queue.append(request.request_id)
-        return token_budget
+        return logical_remaining, physical_remaining
 
     def schedule(self, *, prefer_recurrent=False) -> SchedulerOutput | None:
         """Choose queued requests or an admission opportunity, then build a batch.
