@@ -102,6 +102,39 @@ class ExitConfig:
             raise ValueError("exit seed must be an integer in [0, 2**63)")
 
 
+@dataclass(frozen=True)
+class TokenSparsePrefillConfig:
+    """Token-sparse prefill group (RFC #156, section 7.1).
+
+    ``retention_by_loop[d]`` is the fraction of each selection window that runs
+    recurrent depth ``d``, relative to the window length rather than to the
+    previous active count. The first two depths stay dense because a score
+    compares two completed loops. ``selection_window`` is the fixed token domain
+    of one top-k; ``None`` aligns it with ``SchedulerConfig.prefill_chunk_size``.
+    The candidate retention is a calibration starting point, not a validated default.
+    """
+
+    enabled: bool = False
+    retention_by_loop: tuple[float, ...] = (1.0, 1.0, 0.25, 0.10)
+    selection_window: int | None = None
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        retention = tuple(float(fraction) for fraction in self.retention_by_loop)
+        if len(retention) < 2 or not all(
+            math.isfinite(fraction) and 0 < fraction <= 1 for fraction in retention
+        ):
+            raise ValueError("retention_by_loop needs at least two fractions in (0, 1]")
+        if retention[:2] != (1.0, 1.0):
+            raise ValueError("the first two loops must stay dense")
+        if any(later > earlier for earlier, later in zip(retention, retention[1:])):
+            raise ValueError("retention_by_loop must not increase: active sets are nested")
+        object.__setattr__(self, "retention_by_loop", retention)
+        if self.selection_window is not None:
+            _positive("selection_window", self.selection_window)
+
+
 DEFAULT_CUDA_GRAPH_ROWS = 128
 
 
