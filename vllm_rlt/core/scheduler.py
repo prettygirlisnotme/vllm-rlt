@@ -140,6 +140,7 @@ class Scheduler:
         total_ut_steps: int | None = None,
         eos_token_id=(),
         exit_mode: str = "ouro",
+        token_sparse=None,
     ):
         self.config = config
         self.cache_manager = cache_manager
@@ -154,6 +155,7 @@ class Scheduler:
         else:
             self.eos_token_ids = (eos_token_id,)
         self.exit_mode = exit_mode
+        self.token_sparse = token_sparse
         self.requests: dict[str, Request] = {}
         self.queues: dict[RequestPhase, deque[str]] = {s: deque() for s in RequestPhase}
         self._blocked_priority_preemptions: dict[str, int] = {}
@@ -728,6 +730,16 @@ class Scheduler:
             if left != start:
                 raise RuntimeError("wavefront recurrent task is not at its depth frontier")
             end = min(chunk_end, right, request.num_preluded_tokens)
+            if self.token_sparse is not None and self.token_sparse.config.enabled:
+                window = self.token_sparse.window
+                window_start = start - start % window
+                selection_end = min(len(request.prompt_token_ids), window_start + window)
+                end = min(end, selection_end)
+                if (
+                    self.token_sparse.sparse(depth)
+                    and request.prefill_depth_ranges[depth - 1][0] < selection_end
+                ):
+                    return None
 
         count = min(token_budget, end - start)
         if count <= 0:
@@ -790,7 +802,14 @@ class Scheduler:
 
     def _execution_row_cost(self, scheduled_request, phase):
         """Execution rows for this span; dense work uses every logical token."""
-        return scheduled_request.token_count
+        if self.token_sparse is None or phase != RequestPhase.PREFILLING_RECURRENT:
+            return scheduled_request.token_count
+        return self.token_sparse.execution_rows(
+            len(scheduled_request.request.prompt_token_ids),
+            scheduled_request.depth,
+            scheduled_request.token_start,
+            scheduled_request.token_count,
+        )
 
     def take_phases(self, phases, *, eligible=None):
         """Select compatible requests across queues under one budget/reservation set."""

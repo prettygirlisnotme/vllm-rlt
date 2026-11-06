@@ -17,7 +17,7 @@ from vllm_rlt.worker.buffers import (
     stage_metadata,
 )
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
-from vllm_rlt.worker.executor import ForwardBatch, ModelRuntime
+from vllm_rlt.worker.executor import ForwardBatch, ForwardResult, ModelRuntime
 from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, SubmissionQueue
@@ -82,6 +82,8 @@ class PreparedForward:
     outputs: tuple[tuple[int, Request], ...] | None = None
     hidden_rows: torch.Tensor | None = None
     requests: tuple[Request, ...] = ()
+    logical_hidden: torch.Tensor | None = None
+    scatter_index: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,7 @@ class PreparedExecution:
     packed_metadata: PackedMetadataBuffer | None = None
     sampling_params: tuple = ()
     sampling_generators: tuple = ()
+    active_rows: object = None
 
 
 @dataclass
@@ -758,8 +761,12 @@ class ModelRunner:
             forwards.append(PreparedForward(coda, outputs=(), hidden_rows=coda_rows))
         return tuple(forwards)
 
-    def _stage_metadata(self, ids, depth_sets, positions, *, packed=False, padded_rows=None):
-        layouts = self.metadata.build(ids, depth_sets, positions, packed=packed)
+    def _stage_metadata(
+        self, ids, depth_sets, positions, *, packed=False, padded_rows=None, row_indices=None
+    ):
+        layouts = self.metadata.build(
+            ids, depth_sets, positions, packed=packed, row_indices=row_indices
+        )
         return stage_metadata(layouts, self._append_input, padded_rows=padded_rows)
 
     def _append_input(self, values, dtype):
@@ -824,11 +831,29 @@ class ModelRunner:
             forwards.append(replace(call, forward=forward))
         return tuple(forwards)
 
-    def prepare_on_cpu(self, batch: ExecutionBatch):
-        """Snapshot inputs and plan all host-known metadata before GPU preparation."""
+    def prepare_on_cpu(self, batch: ExecutionBatch, *, active_rows=None):
+        """Snapshot host inputs for an optional single-loop recurrent view.
+
+        The caller must inherit inactive KV before execution. Sparse queries use
+        unpacked metadata; dense and absent views retain the existing path.
+        """
+        if active_rows is not None:
+            if batch.operation != Operation.RECURRENT or batch.loop_count != 1:
+                raise ValueError("active rows require one RECURRENT loop")
+            if active_rows.num_logical_rows != batch.num_rows:
+                raise ValueError("active rows must cover the batch's logical rows")
+            if batch.emit_gate:
+                executed = set(active_rows.gather)
+                end = 0
+                for span in batch.spans:
+                    end += span.token_count
+                    if span.emit_gate and end - 1 not in executed:
+                        raise ValueError("inactive recurrent gate target is not supported")
         for buffer in self.input_buffers.values():
             buffer.reset()
         prepared = self._prepare_cpu_inputs(batch)
+        if active_rows is not None:
+            prepared = replace(prepared, active_rows=active_rows)
         if batch.operation == Operation.PRELUDE and batch.loop_count:
             return prepared
         metadata, boundary_metadata = (), None
@@ -836,6 +861,7 @@ class ModelRunner:
             start = 1 if prepared.kv is not None else 0
             if start < batch.loop_count:
                 ids, depths, positions = batch.addresses()
+                sparse = active_rows is not None and not active_rows.dense
                 metadata = self._stage_metadata(
                     ids,
                     [
@@ -844,7 +870,9 @@ class ModelRunner:
                     ],
                     positions,
                     packed=batch.has_chunks
-                    and self.cache_manager.attention_capabilities.packed_prefill,
+                    and self.cache_manager.attention_capabilities.packed_prefill
+                    and not sparse,
+                    row_indices=active_rows.gather if sparse else None,
                 )
         elif getattr(self.model, "requires_boundary_kv", False):
             ids, depths, positions = batch.addresses()
@@ -1023,21 +1051,44 @@ class ModelRunner:
                 graphs=self.coda_graphs if kv_metadata else None,
             )
             return replace(prepared, forwards=(PreparedForward(self.runtime.prepare(forward)),))
-        graphs = self.graphs if batch.emit_gate else None
+        active_rows = prepared.active_rows
+        sparse = active_rows is not None and not active_rows.dense
+        graphs = None if sparse else (self.graphs if batch.emit_gate else None)
         kv = prepared.kv
         if kv is not None:
             metadata = (kv,) + metadata
+        logical_hidden = scatter_index = None
+        if sparse:
+            logical_hidden = hidden[: batch.num_rows]
+            scatter_index = active_rows.index(hidden.device)
+            hidden = logical_hidden.index_select(0, scatter_index)
+            if kv is not None:
+                metadata = tuple(
+                    self.metadata.take_rows(item, active_rows.gather, scatter_index)
+                    for item in metadata
+                )
+            forward_hidden = hidden
+        else:
+            forward_hidden = (
+                hidden[: batch.num_rows] if graphs is not None or batch.loop_count > 1 else hidden
+            )
         forward = ForwardBatch(
             Operation.RECURRENT,
-            hidden=hidden[: batch.num_rows]
-            if graphs is not None or batch.loop_count > 1
-            else hidden,
+            hidden=forward_hidden,
             metadata=metadata,
             graphs=graphs,
             compute_gate=batch.emit_gate and self.exit_config.mode in ("ouro", "ouro_delayed"),
         )
         return replace(
-            prepared, kv=metadata[0], forwards=(PreparedForward(self.runtime.prepare(forward)),)
+            prepared,
+            kv=metadata[0],
+            forwards=(
+                PreparedForward(
+                    self.runtime.prepare(forward),
+                    logical_hidden=logical_hidden,
+                    scatter_index=scatter_index,
+                ),
+            ),
         )
 
     def _load_hidden(self, batch, prepared, workspace, size):
@@ -1103,8 +1154,17 @@ class ModelRunner:
             forward = entry.forward
             if entry.hidden_rows is not None:
                 forward = replace(forward, hidden=hidden[entry.hidden_rows])
-            result = self.runtime.forward(forward)
-            hidden = result.hidden
+            scatter_index = entry.scatter_index
+            if scatter_index is not None and scatter_index.numel() == 0:
+                result = ForwardResult()
+            else:
+                result = self.runtime.forward(forward)
+            if scatter_index is not None:
+                hidden = entry.logical_hidden.clone()
+                if result.hidden is not None and scatter_index.numel():
+                    hidden.index_copy_(0, scatter_index, result.hidden)
+            else:
+                hidden = result.hidden
             if forward.operation in (Operation.PRELUDE, Operation.RECURRENT):
                 if entry.outputs is None:
                     self._store_hidden(batch, hidden, prepared)
@@ -1113,6 +1173,10 @@ class ModelRunner:
                         self._save(request, hidden[row])
                 if forward.operation == Operation.RECURRENT and batch.emit_gate:
                     logits = result.gate_logits
+                    if scatter_index is not None and logits is not None:
+                        logical_logits = logits.new_zeros(entry.logical_hidden.shape[0])
+                        logical_logits.index_copy_(0, scatter_index, logits)
+                        logits = logical_logits
                     if self.lookahead_head is not None:
                         logits = self.lookahead_head(hidden).squeeze(-1)
                     if logits is not None:

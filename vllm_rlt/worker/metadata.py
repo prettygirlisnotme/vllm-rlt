@@ -177,8 +177,13 @@ class MetadataBuilder:
         *,
         packed=False,
         for_write=True,
+        row_indices: Sequence[int] | None = None,
     ) -> tuple[KVLayout, ...]:
-        """Calculate all requested depth layouts without selecting a storage path."""
+        """Calculate requested depth layouts, optionally for selected logical rows.
+
+        ``row_indices`` selects host-known logical rows after the full request is
+        validated and its allocation snapshot is retained.
+        """
         cache = self.cache
         if not depth_sets:
             raise ValueError("at least one depth assignment is required")
@@ -200,8 +205,14 @@ class MetadataBuilder:
                 )
             )
         positions = [p for _, _, p in first]
-        offsets = [p % cache.block_size for p in positions]
         allocations = tuple(dict(zip(request_ids, (a for a, _, _ in first))).items())
+        if row_indices is not None:
+            indices = tuple(int(index) for index in row_indices)
+            if any(not 0 <= index < len(first) for index in indices):
+                raise ValueError("row indices must select original logical rows")
+            row_sets = [tuple(rows[index] for index in indices) for rows in row_sets]
+            positions = [positions[index] for index in indices]
+        offsets = [p % cache.block_size for p in positions]
         layouts = []
         for rows in row_sets:
             blocks, _ = self._write_addresses(rows, offsets=offsets, for_write=for_write)
@@ -260,6 +271,23 @@ class MetadataBuilder:
             write_offsets=metadata.write_offsets[start:end],
             block_tables=metadata.block_tables[start:end],
             context_lengths=metadata.context_lengths[start:end],
+        )
+
+    @staticmethod
+    def take_rows(metadata, host_indices, device_indices):
+        """Select an arbitrary unpacked row order without rebinding identity."""
+        if metadata.cu_seqlens_q is not None:
+            raise ValueError("packed query boundaries must be rebuilt when selecting rows")
+        if len(host_indices) != len(device_indices):
+            raise ValueError("host and device row indices must have equal lengths")
+        return replace(
+            metadata,
+            rows=tuple(metadata.rows[index] for index in host_indices),
+            position_ids=metadata.position_ids.index_select(0, device_indices),
+            write_blocks=metadata.write_blocks.index_select(0, device_indices),
+            write_offsets=metadata.write_offsets.index_select(0, device_indices),
+            block_tables=metadata.block_tables.index_select(0, device_indices),
+            context_lengths=metadata.context_lengths.index_select(0, device_indices),
         )
 
     @staticmethod
