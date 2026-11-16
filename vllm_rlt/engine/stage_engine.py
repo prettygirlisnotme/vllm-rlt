@@ -79,12 +79,27 @@ class StageEngine:
                 raise ValueError(
                     "boundary-KV models do not support staged prefill required by this scheduler"
                 )
-            if self.execution_config.async_scheduling or self.execution_config.prefill_uva:
+            if self.execution_config.prefill_uva or (
+                self.execution_config.async_scheduling
+                and not getattr(model, "supports_async_scheduling", False)
+            ):
                 raise ValueError(
                     "boundary-KV models require synchronous scheduling without prefill UVA"
                 )
             if speculative_config is not None:
-                raise ValueError("boundary-KV speculative decoding is not yet supported")
+                if not getattr(model, "supports_self_speculation", False):
+                    raise ValueError("boundary-KV speculative decoding is not yet supported")
+                # Qualified: synchronous eager rounds. Async rounds, Graph replay and
+                # resumable preemption of draft/target boundary state are separate work.
+                if (
+                    self.execution_config.async_scheduling
+                    or self.execution_config.cuda_graphs
+                    or scheduler_config.enable_preemption
+                ):
+                    raise ValueError(
+                        "boundary-KV speculative decoding requires synchronous eager "
+                        "execution without CUDA graphs or preemption"
+                    )
         if not getattr(model, "supports_cuda_graphs", True) and self.execution_config.cuda_graphs:
             raise ValueError("this model does not support CUDA graphs yet")
         self.speculative_config = speculative_config
@@ -145,10 +160,16 @@ class StageEngine:
                     speculative_config.num_speculative_tokens,
                 )
         if self.execution_config.async_scheduling:
-            if not self.async_speculative and self.exit_config.mode not in (
-                "ouro_delayed",
-                "random_lookahead",
-                "trace",
+            # A fixed-loop model has no exit decision to delay or look ahead to.
+            if (
+                not self.async_speculative
+                and not getattr(model, "fixed_loop_count", False)
+                and self.exit_config.mode
+                not in (
+                    "ouro_delayed",
+                    "random_lookahead",
+                    "trace",
+                )
             ):
                 raise ValueError(
                     "async scheduling requires ouro_delayed, random_lookahead or trace exit mode"
@@ -179,6 +200,20 @@ class StageEngine:
                 sliding_window=getattr(model, "requires_sliding_window", False),
             ),
         )
+        layer_windows = getattr(model, "kv_layer_windows", None)
+        if layer_windows is not None and (
+            self.execution_config.cuda_graphs
+            or self.execution_config.async_scheduling
+            or speculative_config is not None
+        ):
+            # Device-owned metadata and speculative branches use all-layer blocks.
+            # Keep the existing Graph/async/block/pipeline paths until grouped
+            # storage implements those contracts.
+            if cache_config.reclaim_swa:
+                raise ValueError(
+                    "SWA reclamation requires synchronous eager non-speculative execution"
+                )
+            layer_windows = None
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -187,11 +222,9 @@ class StageEngine:
             attention.info["selected_backend"],
             speculative=speculative_config,
             staged_prefill=staged_prefill,
+            layer_windows=layer_windows,
         )
-        if (
-            getattr(model, "kv_layer_windows", None) is not None
-            and scheduler_config.enable_preemption
-        ):
+        if layer_windows is not None and scheduler_config.enable_preemption:
             raise NotImplementedError("grouped KV does not support preemption snapshots")
         self.cache_manager = KVCacheManager(
             num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
@@ -209,7 +242,7 @@ class StageEngine:
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
-            layer_windows=getattr(model, "kv_layer_windows", None),
+            layer_windows=layer_windows,
             reclaim_swa=cache_config.reclaim_swa,
             max_submission_tokens=min(
                 scheduler_config.prefill_chunk_size, scheduler_config.max_num_batched_tokens
